@@ -1,3 +1,5 @@
+# Enhanced regex patterns and improved medicine name extraction (14 Nov 2025)
+
 from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
