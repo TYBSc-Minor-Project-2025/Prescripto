@@ -1,0 +1,4 @@
+# Suggested cron entries for medication reminders
+# Install with: crontab data/cron_suggestions.txt (after review)
+# Use absolute paths to your Python interpreter and main script.
+
