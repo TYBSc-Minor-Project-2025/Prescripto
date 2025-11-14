@@ -1,103 +1,55 @@
-from __future__ import annotations
+"""
+db.py
+Simple SQLite wrapper used by schedule_creator.py.
+
+API:
+- create_schedule_table()
+- insert_schedule_entry(datetime_obj, medicine, note)
+- fetch_schedules()
+"""
+
 import sqlite3
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from datetime import datetime
+from typing import List, Tuple
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "prescripto.db"
+DB_PATH = "data/prescripto.db"
 
 
-def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
-    p = Path(db_path) if db_path else DB_PATH
-    p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p))
-    conn.execute("PRAGMA foreign_keys = ON;")
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
     return conn
 
 
-def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
-    own_conn = conn is None
-    conn = conn or get_connection()
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS medications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                medicine_id INTEGER NOT NULL,
-                "when" TEXT NOT NULL,
-                time TEXT NOT NULL,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                message TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (medicine_id) REFERENCES medications(id) ON DELETE CASCADE
-            );
-            """
+def create_schedule_table():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reminder_at TIMESTAMP NOT NULL,
+            medicine TEXT NOT NULL,
+            note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        conn.commit()
-    finally:
-        if own_conn:
-            conn.close()
-
-
-def upsert_medicine(conn: sqlite3.Connection, name: str) -> int:
-    cur = conn.execute("SELECT id FROM medications WHERE name = ?", (name,))
-    row = cur.fetchone()
-    if row:
-        return int(row[0])
-    cur = conn.execute("INSERT INTO medications(name) VALUES (?)", (name,))
+    """)
     conn.commit()
-    return int(cur.lastrowid)
+    conn.close()
 
 
-def save_schedule(parsed: Dict, reminders: List[Dict], conn: Optional[sqlite3.Connection] = None) -> List[int]:
-    own_conn = conn is None
-    conn = conn or get_connection()
-    try:
-        med_id = upsert_medicine(conn, parsed.get("medicine") or "Unknown")
-        ids: List[int] = []
-        for r in reminders:
-            cur = conn.execute(
-                """
-                INSERT INTO reminders(medicine_id, "when", time, start_date, end_date, message)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    med_id,
-                    r.get("when"),
-                    r.get("time"),
-                    r.get("start_date"),
-                    r.get("end_date"),
-                    r.get("message"),
-                ),
-            )
-            ids.append(int(cur.lastrowid))
-        conn.commit()
-        return ids
-    finally:
-        if own_conn:
-            conn.close()
+def insert_schedule_entry(reminder_at: datetime, medicine: str, note: str = None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO schedule (reminder_at, medicine, note) VALUES (?, ?, ?)
+    """, (reminder_at, medicine, note))
+    conn.commit()
+    conn.close()
 
 
-def list_reminders(conn: Optional[sqlite3.Connection] = None) -> List[Dict]:
-    own_conn = conn is None
-    conn = conn or get_connection()
-    try:
-        cur = conn.execute(
-            """
-            SELECT r.id, m.name as medicine, r."when", r.time, r.start_date, r.end_date, r.message
-            FROM reminders r
-            JOIN medications m ON m.id = r.medicine_id
-            ORDER BY r.start_date, r.time
-            """
-        )
-        cols = [c[0] for c in cur.description]
-        rows = cur.fetchall()
-        return [dict(zip(cols, row)) for row in rows]
-    finally:
-        if own_conn:
-            conn.close()
+def fetch_schedules(limit: int = 100) -> List[Tuple]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, reminder_at, medicine, note FROM schedule ORDER BY reminder_at LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
