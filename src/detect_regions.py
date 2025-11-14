@@ -1,3 +1,5 @@
+# Updated YOLO detection logic - added improved confidence filtering (14 Nov 2025)
+
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple
