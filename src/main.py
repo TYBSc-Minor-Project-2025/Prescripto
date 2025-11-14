@@ -1,118 +1,95 @@
-from __future__ import annotations
-import argparse
-from pathlib import Path
+"""
+main.py
+End-to-end pipeline for prescription → reminders system.
 
-from src.detect_regions import RegionDetector
-from src.ocr_extract import extract_text
-from src.parse_text import parse_prescription_text, parse_prescription_items
-from src.schedule_creator import build_schedule
-from src.db import init_db, save_schedule, list_reminders
-from utils.preprocess import preprocess_image
-from utils.helpers import ensure_dir, write_lines
+Flow:
+1. Detect medicine/dose regions (YOLO)
+2. Extract text via OCR
+3. Parse medicine name, dose pattern, duration
+4. Generate schedule
+5. Save to SQLite DB
+"""
 
-
-def create_cron_suggestions(reminders: list[dict], out_path: Path) -> None:
-    """
-    Write suggested crontab entries to a file (non-invasive).
-    On macOS, you may prefer launchd, but cron is simpler for demo purposes.
-    """
-    lines: list[str] = [
-        "# Suggested cron entries for medication reminders",
-        "# Install with: crontab data/cron_suggestions.txt (after review)",
-        "# Use absolute paths to your Python interpreter and main script.",
-        "",
-    ]
-    python_path = "python3"  # Adjust if needed
-    main_py = str((Path(__file__).resolve()).parent / "main.py")
-    for r in reminders:
-        hh, mm = (r["time"].split(":") + ["0", "0"])[:2]
-        message = r["message"].replace("\"", "'")
-        cmd = f'{int(mm)} {int(hh)} * * * {python_path} {main_py} --notify "{message}"'
-        lines.append(cmd)
-    write_lines(out_path, lines)
+from src.ocr_extract import extract_text_from_image
+from src.detect_regions import detect_regions
+from src.parse_text import parse_prescription_text
+from src.schedule_creator import (
+    generate_schedule_entries_for_medicine,
+    save_schedule_entries
+)
+import src.db as db
 
 
-def run_pipeline(image_path: str, model_path: str | None = None) -> dict:
-    # Ensure output directories
-    data_dir = ensure_dir(Path(__file__).resolve().parent.parent / "data" / "ocr_output")
+def process_prescription(image_path: str):
+    print(f"\n[INFO] Processing prescription: {image_path}")
 
-    # Preprocess image
-    pre_img = preprocess_image(image_path, out_dir=str(data_dir))
-
-    # Detect regions (if model is provided)
-    detector = RegionDetector(model_path=model_path)
-    regions = detector.detect(pre_img)
-
-    # OCR
-    ocr = extract_text(pre_img, regions=regions)
-
-    # Parse (support multi-item prescriptions)
-    raw_text = ocr.get("raw_text", "")
-    items = parse_prescription_items(raw_text)
-    if items:
-        parsed_list = items
-    else:
-        parsed_list = [parse_prescription_text(raw_text)]
-
-    # Schedule for each item
-    reminders = []
-    for p in parsed_list:
-        reminders.extend(build_schedule(p))
-
-    return {
-        "regions": regions,
-        "ocr": ocr,
-        "parsed": parsed_list,
-        "reminders": reminders,
-    }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Smart Medication Reminder - Prescripto")
-    parser.add_argument("image", nargs="?", help="Path to prescription image (jpg/png)")
-    parser.add_argument("--model", dest="model", default=None, help="Path to YOLO model (optional)")
-    parser.add_argument("--notify", dest="notify_msg", default=None, help="Send a one-off notification and exit")
-    args = parser.parse_args()
-
-    if args.notify_msg:
-        # On-demand notify mode
-        from src.notify import desktop_notify, play_sound
-
-        desktop_notify("Medication Reminder", args.notify_msg)
-        play_sound()
+    # -------------------------
+    # 1. Detect regions
+    # -------------------------
+    try:
+        regions = detect_regions(image_path)
+        print("[OK] Regions detected")
+    except Exception as e:
+        print("[ERROR] Region detection failed:", e)
         return
 
-    if not args.image:
-        print("Please provide an image path. Example: python -m src.main data/sample_prescriptions/p1.jpg")
+    # -------------------------
+    # 2. OCR extraction
+    # -------------------------
+    try:
+        extracted_text = extract_text_from_image(image_path, regions)
+        print("[OK] OCR extraction complete")
+    except Exception as e:
+        print("[ERROR] OCR failed:", e)
         return
 
-    # Initialize DB
-    init_db()
+    # -------------------------
+    # 3. Parse prescription
+    # -------------------------
+    try:
+        parsed = parse_prescription_text(extracted_text)
+        print("[OK] Parsing complete")
+        print("Parsed Output:", parsed)
+    except Exception as e:
+        print("[ERROR] Parsing failed:", e)
+        return
 
-    # Run pipeline
-    result = run_pipeline(args.image, model_path=args.model)
+    # Expected parsed output structure:
+    # {
+    #   "medicine": "Paracetamol 500mg",
+    #   "dose": "1-0-1",
+    #   "duration_days": 5,
+    #   "notes": "after food"
+    # }
 
-    # Persist schedule for each parsed item
-    parsed_items = result["parsed"] if isinstance(result["parsed"], list) else [result["parsed"]]
-    for p in parsed_items:
-        save_schedule(p, [r for r in result["reminders"] if r.get("medicine") == p.get("medicine")])
+    # -------------------------
+    # 4. Generate schedule
+    # -------------------------
+    try:
+        schedule = generate_schedule_entries_for_medicine(
+            med_name=parsed["medicine"],
+            dose_pattern=parsed["dose"],
+            duration_days=parsed.get("duration_days", 5),
+            fallback_instr=parsed.get("notes"),
+            start_date=None
+        )
+        print("[OK] Schedule generated")
+    except Exception as e:
+        print("[ERROR] Schedule creation failed:", e)
+        return
 
-    # Output summary
-    print("Parsed items:")
-    for p in parsed_items:
-        print(p)
-
-    # List reminders
-    reminders = list_reminders()
-    print("\nReminders saved (total: %d):" % len(reminders))
-    for r in reminders:
-        print(f"- {r['start_date']} {r['time']} {r['message']}")
-
-    # Suggest cron
-    cron_file = Path(__file__).resolve().parent.parent / "data" / "cron_suggestions.txt"
-    create_cron_suggestions(result["reminders"], cron_file)
-    print(f"\nCron suggestions written to: {cron_file}")
+    # -------------------------
+    # 5. Save to DB
+    # -------------------------
+    try:
+        saved_count = save_schedule_entries(db, schedule)
+        print(f"[OK] Saved {saved_count} reminders to DB for {schedule.medicine}")
+    except Exception as e:
+        print("[ERROR] Saving schedule failed:", e)
+        return
 
 
 if __name__ == "__main__":
-    main()
+    # temp test image
+    sample_image = "data/sample_prescriptions/prescription.png"
+    process_prescription(sample_image)
