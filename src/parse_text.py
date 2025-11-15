@@ -1,161 +1,132 @@
-# Enhanced regex patterns and improved medicine name extraction (14 Nov 2025)
+
+# filepath: /Users/anuragbhosale/Desktop/Projects/Prescripto/src/parse_text.py
+"""
+parse_text.py
+Parse raw OCR text from a prescription into a structured representation.
+
+This is intentionally simple and heuristic-based; you can refine it over time
+for your own prescription formats.
+"""
 
 from __future__ import annotations
+
+import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional
 
-DURATION_RE = re.compile(r"\b(\d+)\s*(day|days|week|weeks)\b", re.I)
-DOSE_RE = re.compile(r"\b(\d-\d-\d)\b")
-# include common abbreviations often seen in prescriptions
-TIME_WORDS = ["morning", "noon", "afternoon", "aft", "evening", "eve", "night"]
-TIME_RE = re.compile(r"\b(" + "|".join(TIME_WORDS) + r")\b", re.I)
+logger = logging.getLogger(__name__)
 
 
-def _guess_medicine_names(text: str) -> List[str]:
-    # Heuristic: pick capitalized words 3+ chars or lines starting with a name-like token
-    meds: List[str] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
+@dataclass
+class ParsedPrescription:
+    medicine: str
+    dose: str
+    duration_days: int
+    notes: str = ""
+
+
+DOSE_PATTERN = re.compile(r"\b(\d-\d-\d)\b")
+DURATION_PATTERN = re.compile(r"(\d+)\s*(day|days|d)\b", re.IGNORECASE)
+
+
+def _extract_medicine_name(text: str) -> str:
+    """
+    Very naive medicine name extractor: take the first non-empty line
+    that does not look like a pure dose or duration line.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "Unknown Medicine"
+
+    for line in lines:
+        if DOSE_PATTERN.search(line):
             continue
-        tokens = re.findall(r"[A-Za-z][A-Za-z\-]{2,}", line)
-        # Filter common non-medicine words
-        blacklist = {"morning", "afternoon", "evening", "night", "daily", "tablet", "tabs", "capsule", "mg", "ml"}
-        cand = [t for t in tokens if t.lower() not in blacklist]
-        if cand:
-            meds.append(cand[0])
-    # Deduplicate while preserving order
-    out: List[str] = []
-    for m in meds:
-        if m not in out:
-            out.append(m)
-    return out[:1]  # return first guess
+        if DURATION_PATTERN.search(line):
+            continue
+        # First reasonable candidate
+        return line
+
+    # Fallback to first line
+    return lines[0]
 
 
-def _parse_duration_days(text: str) -> Optional[int]:
-    m = DURATION_RE.search(text)
-    if not m:
-        return None
-    num = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit.startswith("week"):
-        return num * 7
-    return num
-
-
-def _parse_times(text: str) -> List[str]:
-    hits = [m.group(1).lower() for m in TIME_RE.finditer(text)]
-    # Normalize noon/afternoon overlap
-    norm = []
-    for t in hits:
-        if t in ("afternoon", "aft"):
-            norm.append("noon")
-        elif t == "eve":
-            norm.append("evening")
-        else:
-            norm.append(t)
-    # Deduplicate preserve order
-    seen, out = set(), []
-    for t in norm:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def parse_prescription_text(text: str) -> Dict:
+def _extract_dose(text: str) -> str:
     """
-    Map raw OCR text to structured prescription data.
-    Returns a dict like:
-    {
-      "medicine": "Paracetamol",
-      "dose": "1-0-1",
-      "time": ["morning", "night"],
-      "duration_days": 5
-    }
+    Find a pattern like '1-0-1' in the text.
     """
-    text = text or ""
-    medicine = None
-    meds = _guess_medicine_names(text)
-    if meds:
-        medicine = meds[0]
-
-    dose = None
-    m = DOSE_RE.search(text)
+    m = DOSE_PATTERN.search(text)
     if m:
-        dose = m.group(1)
+        return m.group(1)
+    return "0-0-0"
 
-    times = _parse_times(text)
 
-    duration_days = _parse_duration_days(text)
+def _extract_duration_days(text: str) -> int:
+    """
+    Find something like '5 days' and return 5.
+    Defaults to 5 if not found.
+    """
+    m = DURATION_PATTERN.search(text)
+    if not m:
+        return 5
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return 5
 
-    # If dose is present but times missing, infer from dose pattern
-    if dose and not times:
-        parts = dose.split("-")
-        slot_names = ["morning", "noon", "night"]
-        for idx, p in enumerate(parts[:3]):
-            if p == "1":
-                times.append(slot_names[idx])
 
-    # If times present but dose missing, infer a simple 1 per time
-    if times and not dose:
-        slots = ["morning", "noon", "night"]
-        dose = "-".join(["1" if s in times else "0" for s in slots])
+def _extract_notes(text: str, medicine: str, dose: str) -> str:
+    """
+    Very simple notes extractor: return remaining text that isn't clearly
+    the medicine or dose line. You can improve this later.
+    """
+    cleaned = text.replace(medicine, "").replace(dose, "")
+    cleaned = cleaned.strip()
+    return cleaned
 
-    return {
-        "medicine": medicine or "Unknown",
-        "dose": dose or "0-0-0",
-        "time": times or [],
-        "duration_days": duration_days or 1,
+
+def parse_prescription_text(text: str) -> Dict[str, object]:
+    """
+    Parse raw OCR text into a structured dictionary.
+
+    Returns
+    -------
+    {
+        "medicine": str,
+        "dose": str,           # "1-0-1"
+        "duration_days": int,  # e.g. 5
+        "notes": str,
     }
-
-
-# ---------- Multi-item parsing (table or enumerated list) ----------
-
-ITEM_START_RE = re.compile(r"^\s*(\d+)\)\s*(.+)$", re.M)
-
-
-def _split_items(text: str) -> List[Tuple[str, int, int]]:
-    """Return list of (item_text, start_index, end_index)."""
-    matches = list(ITEM_START_RE.finditer(text))
-    if not matches:
-        return []
-    items: List[Tuple[str, int, int]] = []
-    for i, m in enumerate(matches):
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        items.append((text[start:end].strip(), start, end))
-    return items
-
-
-def _clean_medicine_name(line: str) -> str:
-    # Remove leading ordinal like "1)"
-    line = re.sub(r"^\s*\d+\)\s*", "", line).strip()
-    # Drop common dosage form prefixes
-    line = re.sub(r"^(TAB\.?|CAP\.?|SYR\.?|INJ\.?)\s*", "", line, flags=re.I).strip()
-    # Collapse extra spaces / punctuation
-    line = re.sub(r"\s{2,}", " ", line)
-    return line
-
-
-def parse_prescription_items(text: str) -> List[Dict]:
     """
-    Parse multiple prescription rows like:
-    1) TAB. NAME ... \n 1 Morning, 1 Night ... \n 10 Days
-    Returns a list of dicts with the same schema as parse_prescription_text.
-    """
-    segments = _split_items(text or "")
-    items: List[Dict] = []
-    if not segments:
-        return items
-    for seg, _s, _e in segments:
-        lines = [ln.strip() for ln in seg.splitlines() if ln.strip()]
-        if not lines:
-            continue
-        med_line = lines[0]
-        medicine = _clean_medicine_name(med_line)
-        # Reuse single-item parser on the segment to capture dose/time/duration
-        parsed = parse_prescription_text(seg)
-        parsed["medicine"] = medicine or parsed.get("medicine") or "Unknown"
-        items.append(parsed)
-    return items
+    if not text or not text.strip():
+        logger.warning("Empty OCR text passed to parse_prescription_text")
+        return {
+            "medicine": "Unknown Medicine",
+            "dose": "0-0-0",
+            "duration_days": 5,
+            "notes": "",
+        }
+
+    logger.info("Parsing OCR text:\n%s", text)
+
+    medicine = _extract_medicine_name(text)
+    dose = _extract_dose(text)
+    duration_days = _extract_duration_days(text)
+    notes = _extract_notes(text, medicine, dose)
+
+    parsed = ParsedPrescription(
+        medicine=medicine,
+        dose=dose,
+        duration_days=duration_days,
+        notes=notes,
+    )
+
+    logger.info("Parsed prescription: %s", parsed)
+
+    # Return as a plain dict to keep the rest of the code simple
+    return {
+        "medicine": parsed.medicine,
+        "dose": parsed.dose,
+        "duration_days": parsed.duration_days,
+        "notes": parsed.notes,
+    }

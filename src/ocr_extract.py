@@ -1,77 +1,100 @@
-# Updated OCR module - cleaned preprocessing pipeline (14 Nov 2025)
+
+# filepath: /Users/anuragbhosale/Desktop/Projects/Prescripto/src/ocr_extract.py
+"""
+ocr_extract.py
+Utilities to run OCR on detected regions of a prescription image.
+"""
 
 from __future__ import annotations
+
+import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
-import io
+from typing import Iterable, List, Tuple
+
+from PIL import Image
 
 try:
-    from PIL import Image
-except Exception:  # pragma: no cover
-    Image = None  # type: ignore
-
-try:  # optional dependency
-    import pytesseract  # type: ignore
-except Exception:  # pragma: no cover
+    import pytesseract
+except ImportError:  # pytesseract is optional but strongly recommended
     pytesseract = None  # type: ignore
 
-BBox = Tuple[int, int, int, int]
+logger = logging.getLogger(__name__)
+
+# Type aliases
+BBox = Tuple[int, int, int, int]  # (x1, y1, x2, y2)
 
 
-def _crop_region(image_path: str, bbox: BBox) -> Optional[Any]:
-    if Image is None:
-        return None
-    try:
-        with Image.open(image_path) as im:
-            x, y, w, h = bbox
-            x2, y2 = x + max(0, w), y + max(0, h)
-            return im.crop((x, y, x2, y2)).copy()
-    except Exception:
-        return None
-
-
-def _ocr_image(img: Any, lang: str = "eng") -> str:
+def _ensure_pytesseract_available() -> None:
+    """
+    Raise a clear error if pytesseract is not installed.
+    """
     if pytesseract is None:
-        return ""  # graceful fallback
-    try:
-        return pytesseract.image_to_string(img, lang=lang) or ""
-    except Exception:
-        return ""
+        raise RuntimeError(
+            "pytesseract is not installed. Install it with "
+            "`pip install pytesseract` and ensure Tesseract OCR is available "
+            "on your system."
+        )
 
 
-def extract_text(image_path: str, regions: Optional[Dict[str, BBox]] = None, lang: str = "eng") -> Dict:
+def _open_image(path: str | Path) -> Image.Image:
     """
-    OCR the full image or detected regions.
-
-    Returns dict:
-    {
-      'raw_text': '...',
-      'by_region': {'medicine': 'Paracetamol', ...}
-    }
+    Open an image from disk and convert to RGB.
     """
-    image_path = str(Path(image_path))
-    by_region: Dict[str, str] = {}
+    img_path = Path(path)
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image not found: {img_path}")
+    return Image.open(img_path).convert("RGB")
 
-    if regions:
-        for name, bbox in regions.items():
-            img = _crop_region(image_path, bbox)
-            if img is None and Image is not None:
-                try:
-                    img = Image.open(image_path)  # fallback: whole image
-                except Exception:
-                    img = None
-            if img is not None:
-                by_region[name] = _ocr_image(img, lang=lang)
-    else:
-        # Full image OCR
-        if Image is not None:
-            try:
-                with Image.open(image_path) as im:
-                    by_region["full"] = _ocr_image(im, lang=lang)
-            except Exception:
-                by_region["full"] = ""
-        else:
-            by_region["full"] = ""
 
-    raw_text = "\n".join([t for t in by_region.values() if t]).strip()
-    return {"raw_text": raw_text, "by_region": by_region}
+def _ocr_image_region(img: Image.Image, bbox: BBox) -> str:
+    """
+    Run OCR on a single cropped region.
+    """
+    _ensure_pytesseract_available()
+
+    x1, y1, x2, y2 = bbox
+    crop = img.crop((x1, y1, x2, y2))
+
+    # Configure for single block of text; tweak as needed
+    config = "--oem 3 --psm 6"
+    text = pytesseract.image_to_string(crop, config=config)  # type: ignore[arg-type]
+    return text.strip()
+
+
+def extract_text_from_image(
+    image_path: str | Path,
+    regions: Iterable[BBox],
+) -> str:
+    """
+    Given the original image path and list/iterable of bounding boxes,
+    run OCR on each region and return the concatenated text.
+
+    Parameters
+    ----------
+    image_path:
+        Path to the original image.
+    regions:
+        Iterable of (x1, y1, x2, y2) bounding boxes.
+
+    Returns
+    -------
+    str
+        Combined OCR text from all regions, joined by newlines.
+    """
+    logger.info("Starting OCR on %d region(s)", len(list(regions)))
+
+    img = _open_image(image_path)
+    texts: List[str] = []
+
+    for idx, bbox in enumerate(regions):
+        try:
+            region_text = _ocr_image_region(img, bbox)
+            logger.info("Region %d OCR text: %s", idx, region_text.replace("\n", " "))
+            if region_text:
+                texts.append(region_text)
+        except Exception as e:
+            logger.error("OCR failed for region %d (%s): %s", idx, bbox, e, exc_info=True)
+
+    combined = "\n".join(texts).strip()
+    logger.info("OCR complete, total %d non-empty region(s)", len(texts))
+    return combined

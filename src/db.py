@@ -1,55 +1,137 @@
+
+# filepath: /Users/anuragbhosale/Desktop/Projects/Prescripto/src/db.py
 """
 db.py
-Simple SQLite wrapper used by schedule_creator.py.
-
-API:
-- create_schedule_table()
-- insert_schedule_entry(datetime_obj, medicine, note)
-- fetch_schedules()
+SQLite helper utilities for Prescripto.
 """
 
+from __future__ import annotations
+
+import logging
+import os
 import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from pathlib import Path
+from typing import Iterator, Optional
 
-DB_PATH = "data/prescripto.db"
+logger = logging.getLogger(__name__)
+
+# DB path can be overridden by environment variable
+DB_PATH = Path(os.getenv("PRESCRIPTO_DB_PATH", "data/prescripto.db"))
 
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    return conn
+@dataclass
+class Reminder:
+    id: Optional[int]
+    medicine: str
+    remind_at: datetime
+    slot: str
+    notes: str = ""
 
 
-def create_schedule_table():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS schedule (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reminder_at TIMESTAMP NOT NULL,
-            medicine TEXT NOT NULL,
-            note TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+def _ensure_parent_dir(path: Path) -> None:
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def get_conn() -> Iterator[sqlite3.Connection]:
+    """
+    Context manager that opens a connection and ensures it is closed.
+    """
+    _ensure_parent_dir(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    """
+    Create the reminders table if it does not exist.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                medicine TEXT NOT NULL,
+                remind_at TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                notes TEXT DEFAULT ''
+            );
+            """
         )
-    """)
-    conn.commit()
-    conn.close()
+    logger.info("Database initialized at %s", DB_PATH)
 
 
-def insert_schedule_entry(reminder_at: datetime, medicine: str, note: str = None):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO schedule (reminder_at, medicine, note) VALUES (?, ?, ?)
-    """, (reminder_at, medicine, note))
-    conn.commit()
-    conn.close()
+def insert_reminder(
+    medicine: str,
+    remind_at,
+    slot: str,
+    notes: str = "",
+) -> int:
+    """
+    Insert a reminder row and return its new ID.
+    `remind_at` can be a datetime or ISO string.
+    """
+    if isinstance(remind_at, datetime):
+        remind_at_str = remind_at.isoformat()
+    else:
+        remind_at_str = str(remind_at)
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO reminders (medicine, remind_at, slot, notes)
+            VALUES (?, ?, ?, ?)
+            """,
+            (medicine, remind_at_str, slot, notes),
+        )
+        reminder_id = int(cur.lastrowid)
+    logger.info(
+        "Inserted reminder id=%d medicine=%s at %s (%s)",
+        reminder_id,
+        medicine,
+        remind_at_str,
+        slot,
+    )
+    return reminder_id
 
 
-def fetch_schedules(limit: int = 100) -> List[Tuple]:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, reminder_at, medicine, note FROM schedule ORDER BY reminder_at LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def get_upcoming_reminders(limit: int = 50):
+    """
+    Fetch upcoming reminders ordered by time.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT id, medicine, remind_at, slot, notes
+            FROM reminders
+            ORDER BY remind_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    reminders = []
+    for r in rows:
+        reminders.append(
+            Reminder(
+                id=r["id"],
+                medicine=r["medicine"],
+                remind_at=datetime.fromisoformat(r["remind_at"]),
+                slot=r["slot"],
+                notes=r["notes"] or "",
+            )
+        )
+    return reminders

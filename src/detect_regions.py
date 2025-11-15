@@ -1,91 +1,112 @@
-# Updated YOLO detection logic - added improved confidence filtering (14 Nov 2025)
+
+# filepath: /Users/anuragbhosale/Desktop/Projects/Prescripto/src/detect_regions.py
+"""
+detect_regions.py
+Use a YOLO model (if available) to detect text/medicine regions in a prescription.
+
+If the YOLO dependency isn't installed or the model can't be loaded,
+this module falls back to returning a single region covering the whole image.
+"""
 
 from __future__ import annotations
+
+import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import List, Tuple
+
+from PIL import Image
 
 try:
     from ultralytics import YOLO  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+except ImportError:
     YOLO = None  # type: ignore
 
-try:
-    from PIL import Image
-except Exception:  # pragma: no cover - optional dependency
-    Image = None  # type: ignore
+logger = logging.getLogger(__name__)
 
-BBox = Tuple[int, int, int, int]  # x, y, w, h
+# Type aliases
+BBox = Tuple[int, int, int, int]  # (x1, y1, x2, y2)
 
 
-class RegionDetector:
+def _load_model(model_path: str | Path | None = None):
     """
-    YOLO-based region detector with safe fallbacks.
-    Returns a dict of named regions to bounding boxes in xywh format.
-    Keys may include: 'medicine', 'dose', 'frequency', 'duration'.
-    Fallback returns {'full': (0,0,W,H)} to OCR the entire image.
+    Load the YOLO model if ultralytics is available.
     """
+    if YOLO is None:
+        logger.warning(
+            "ultralytics is not installed. "
+            "Install it with `pip install ultralytics` to enable region detection."
+        )
+        return None
 
-    LABEL_MAP = {
-        "medicine": "medicine",
-        "med": "medicine",
-        "dose": "dose",
-        "dosage": "dose",
-        "freq": "frequency",
-        "frequency": "frequency",
-        "duration": "duration",
-        "days": "duration",
-    }
+    # Allow a custom model path, or default to a local file if shipped with the project
+    if model_path is None:
+        model_path = Path(__file__).parent / "models" / "prescripto-yolo.pt"
 
-    def __init__(self, model_path: Optional[str] = None) -> None:
-        self.model_path = Path(model_path) if model_path else None
-        self.model = None
-        if YOLO and self.model_path and self.model_path.exists():
-            try:
-                self.model = YOLO(str(self.model_path))
-            except Exception:
-                self.model = None
+    model_path = Path(model_path)
+    if not model_path.exists():
+        logger.warning(
+            "YOLO model not found at %s. Falling back to full-image region.",
+            model_path,
+        )
+        return None
 
-    def detect(self, image_path: str) -> Dict[str, BBox]:
-        regions: Dict[str, BBox] = {}
-        width, height = 0, 0
-        if Image is not None:
-            try:
-                with Image.open(image_path) as im:
-                    width, height = im.size
-            except Exception:
-                pass
+    try:
+        logger.info("Loading YOLO model from %s", model_path)
+        return YOLO(str(model_path))
+    except Exception as e:
+        logger.error("Failed to load YOLO model: %s", e, exc_info=True)
+        return None
 
-        if not self.model:
-            # Fallback: OCR entire image
-            regions["full"] = (0, 0, width, height)
-            return regions
 
-        try:
-            results = self.model(image_path)
-            # Ultralytics result API
-            for r in results:
-                boxes = getattr(r, "boxes", None)
-                names = getattr(r, "names", None) or getattr(self.model, "names", {})
-                if boxes is None:
-                    continue
-                for b in boxes:
-                    try:
-                        cls_idx = int(b.cls)
-                        label = str(names.get(cls_idx, cls_idx)).lower() if isinstance(names, dict) else str(cls_idx)
-                        xyxy = b.xyxy[0].tolist() if hasattr(b, "xyxy") else None
-                        if not xyxy:
-                            continue
-                        x1, y1, x2, y2 = map(int, xyxy)
-                        key = self.LABEL_MAP.get(label)
-                        if key:
-                            regions[key] = (x1, y1, max(0, x2 - x1), max(0, y2 - y1))
-                    except Exception:
-                        continue
-        except Exception:
-            # On any failure, use full image
-            regions["full"] = (0, 0, width, height)
+def _full_image_region(image_path: str | Path) -> List[BBox]:
+    """
+    Fallback: return a single region that covers the whole image.
+    """
+    img = Image.open(image_path)
+    w, h = img.size
+    logger.info("Using full-image region fallback: width=%d height=%d", w, h)
+    return [(0, 0, w, h)]
 
-        # If nothing recognized, still return full image fallback
-        if not regions:
-            regions["full"] = (0, 0, width, height)
-        return regions
+
+def detect_regions(image_path: str | Path) -> List[BBox]:
+    """
+    Detect text/medicine regions on the prescription image.
+
+    Returns
+    -------
+    List[Tuple[int, int, int, int]]
+        A list of bounding boxes in (x1, y1, x2, y2) format.
+    """
+    image_path = str(image_path)
+    model = _load_model()
+
+    # If no model, fallback
+    if model is None:
+        return _full_image_region(image_path)
+
+    try:
+        logger.info("Running YOLO detection on %s", image_path)
+        results = model(image_path)
+    except Exception as e:
+        logger.error("YOLO inference failed: %s", e, exc_info=True)
+        return _full_image_region(image_path)
+
+    boxes: List[BBox] = []
+
+    # ultralytics.YOLO returns a list of Results; we take the first
+    for r in results:
+        if not hasattr(r, "boxes") or r.boxes is None:
+            continue
+
+        for box in r.boxes:  # type: ignore[attr-defined]
+            # xyxy format: [x1, y1, x2, y2]
+            xyxy = box.xyxy[0].tolist()  # type: ignore[index]
+            x1, y1, x2, y2 = map(int, xyxy)
+            boxes.append((x1, y1, x2, y2))
+
+    if not boxes:
+        logger.warning("YOLO returned no boxes; using full-image region fallback.")
+        return _full_image_region(image_path)
+
+    logger.info("Detected %d region(s)", len(boxes))
+    return boxes
